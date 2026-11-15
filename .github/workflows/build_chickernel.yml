@@ -107,8 +107,7 @@ jobs:
             -e '/^TRIM_NONLISTED_KMI=/d' \
             -e '/^KMI_ENFORCED=/d' \
             -e '$a\KMI_SYMBOL_LIST_STRICT_MODE=0' \
-            -e '$a\TRIM_NONLISTED_KMI=0' \
-            -e '$a\KMI_ENFORCED=0' \
+            -e '$a\TRIM_NONLISTED_KMI=0' \ -e '$a\KMI_ENFORCED=0' \
             -e '/^MODULES_ORDER=/d' \
             -e '/^MODULES_LIST=/d' \
             ${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki.aarch64
@@ -130,6 +129,25 @@ jobs:
           sed -i 's/,baseband_guard//g' security/Kconfig || true
           sed -i '/kernelsu/d' drivers/Makefile || true
           sed -i '/kernelsu/d' drivers/Kconfig || true
+
+          # Отключаем старые ручные хуки KSU в файлах ядра (так как новый KSU-Next v3.4.2 использует Kprobes/Tracepoints)
+          for f in fs/open.c fs/read_write.c fs/stat.c fs/exec.c drivers/tty/pty.c drivers/input/input.c fs/namespace.c; do
+            if [ -f "$f" ]; then
+              sed -i 's/#ifdef CONFIG_KSU$/#ifdef CONFIG_KSU_LEGACY_MANUAL_HOOKS_DISABLED/g' "$f"
+              sed -i 's/#if defined(CONFIG_KSU)$/#if defined(CONFIG_KSU_LEGACY_MANUAL_HOOKS_DISABLED)/g' "$f"
+              sed -i 's/ksu_handle_stat([^;]*;/0;/g' "$f"
+              sed -i 's/ksu_handle_sys_read([^;]*;/0;/g' "$f"
+              sed -i 's/ksu_handle_vfs_read([^;]*;/0;/g' "$f"
+              sed -i 's/ksu_handle_faccessat([^;]*;/0;/g' "$f"
+              sed -i 's/ksu_handle_execveat([^;]*;/0;/g' "$f"
+              sed -i 's/ksu_handle_execveat_sucompat([^;]*;/0;/g' "$f"
+              sed -i 's/ksu_handle_devpts([^;]*;/0;/g' "$f"
+              sed -i 's/ksu_handle_input_handle_event([^;]*;/0;/g' "$f"
+              sed -i 's/unlikely(ksu_execveat_hook)/0/g' "$f"
+              sed -i 's/unlikely(ksu_vfs_read_hook)/0/g' "$f"
+              sed -i 's/unlikely(ksu_input_hook)/0/g' "$f"
+            fi
+          done
 
           # Устанавливаем свежий KernelSU-Next
           curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev/kernel/setup.sh" | bash -s ${{ github.event.inputs.ksuBranch }}
@@ -153,65 +171,4 @@ jobs:
                 -e 's|security_context_to_sid(&fake_state, buf, size, &sid, GFP_KERNEL)|security_context_to_sid_with_policy(backup_sepolicy, buf, size, \&sid, SECSID_NULL, GFP_KERNEL, NULL, NULL)|' \
                 -e 's|security_sid_to_context(&fake_state, sid, &canon, &len)|security_sid_to_context_with_policy(backup_sepolicy, sid, \&canon, \&len)|' \
                 -e 's|security_context_str_to_sid(&fake_state, scon, &ssid, GFP_KERNEL)|security_context_to_sid_with_policy(backup_sepolicy, scon, strlen(scon), \&ssid, SECSID_NULL, GFP_KERNEL, NULL, NULL)|' \
-                -e 's|security_context_str_to_sid(&fake_state, tcon, &tsid, GFP_KERNEL)|security_context_to_sid_with_policy(backup_sepolicy, tcon, strlen(tcon), \&tsid, SECSID_NULL, GFP_KERNEL, NULL, NULL)|' \
-                -e 's|security_compute_av_user(&fake_state, ssid, tsid, tclass, &avd)|security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, \&avd)|' \
-                "$FS"
-            fi
-            if [ -f "$HK" ]; then
-              sed -i \
-                -e "s|^extern struct selinux_state fake_state;|${E1}\n${E2}|" \
-                -e 's|security_context_to_sid(&fake_state, value, size, &tmp_sid, GFP_KERNEL)|security_context_to_sid_with_policy(backup_sepolicy, value, size, \&tmp_sid, SECSID_NULL, GFP_KERNEL, NULL, NULL)|' \
-                "$HK"
-            fi
-          fi
-
-          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
-
-          # Отключаем BBG и старый SUSFS
-          sed -i '/CONFIG_BBG/d' "$CONFIG_FILE"
-          sed -i '/CONFIG_KSU_SUSFS/d' "$CONFIG_FILE"
-          echo "# CONFIG_KSU_SUSFS is not set" >> "$CONFIG_FILE"
-
-          # Переключаем LTO на быстрый ThinLTO (сборка за 10-12 минут вместо часа)
-          sed -i '/CONFIG_LTO_CLANG/d' "$CONFIG_FILE"
-          sed -i '/CONFIG_THINLTO/d' "$CONFIG_FILE"
-          echo "CONFIG_LTO_CLANG=y" >> "$CONFIG_FILE"
-          echo "# CONFIG_LTO_CLANG_FULL is not set" >> "$CONFIG_FILE"
-          echo "CONFIG_LTO_CLANG_THIN=y" >> "$CONFIG_FILE"
-          echo "CONFIG_THINLTO=y" >> "$CONFIG_FILE"
-
-          # Включаем KSU и поддержку метамодулей
-          sed -i '/^CONFIG_KSU=/d' "$CONFIG_FILE"
-          echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
-          echo "CONFIG_KALLSYMS=y" >> "$CONFIG_FILE"
-          echo "CONFIG_TMPFS_XATTR=y" >> "$CONFIG_FILE"
-          echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$CONFIG_FILE"
-          echo "CONFIG_OVERLAY_FS=y" >> "$CONFIG_FILE"
-
-          if [ -n "${{ github.event.inputs.localVersion }}" ]; then
-            sed -i '/^CONFIG_LOCALVERSION=/d' "$CONFIG_FILE"
-            echo 'CONFIG_LOCALVERSION="${{ github.event.inputs.localVersion }}"' >> "$CONFIG_FILE"
-          fi
-
-      - name: "🔨 Build Kernel"
-        working-directory: ${{ env.WORK_DIR }}
-        run: |
-          LTO=thin BUILD_CONFIG=${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki.aarch64 build/build.sh -j$(nproc --all)
-
-      - name: "📦 Package AnyKernel3 ZIP"
-        working-directory: ${{ env.WORK_DIR }}
-        run: |
-          git clone --depth=1 https://github.com/yougotme101/AnyKernel3 -b master AnyKernel3
-          cp out/dist/Image AnyKernel3/Image.ksu
-          ZIP_NAME="ChicKernel_KSUNext${{ github.event.inputs.localVersion }}_$(date +'%Y-%m-%d').zip"
-          cd AnyKernel3
-          zip -r9 "../$ZIP_NAME" * -x .git/*
-          cd ..
-          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
-
-      - name: "📤 Upload Flashable ZIP"
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ZIP_NAME }}
-          path: ${{ env.WORK_DIR }}/${{ env.ZIP_NAME }}
-          retention-days: 5
+                -e 's|security_context_str_to_sid(&fake_state
