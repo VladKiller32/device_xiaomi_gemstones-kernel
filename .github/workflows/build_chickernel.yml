@@ -1,0 +1,132 @@
+name: "Build ChicKernel Upgraded (KSU-Next)"
+
+env:
+  WORK_DIR: ${{ github.workspace }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      localVersion:
+        description: "Имя ядра (localversion)"
+        required: false
+        default: "-VladKernel32"
+      ksuBranch:
+        description: "Ветка KernelSU-Next (dev или next)"
+        required: true
+        default: "dev"
+
+jobs:
+  Build-Kernel:
+    name: "🚀 Compile ChicKernel"
+    runs-on: ubuntu-latest
+    env:
+      kernelDir: common_gemstones
+      kernelName: common
+      DEFCONFIG_NAME: chickernel_defconfig
+
+    steps:
+      - name: "✨ Setup workspace"
+        run: |
+          mkdir -p $kernelDir
+          sudo apt-get update -qq
+          sudo apt-get install -y repo rsync aria2 build-essential bc curl flex cpio git zip dwarves libelf-dev gcc-aarch64-linux-gnu libssl-dev python3 clang lld llvm llvm-dev
+
+      - name: "🌟 Clone ChicKernel source"
+        working-directory: ./${{ env.kernelDir }}
+        run: |
+          git clone --branch android13-5.15-lts \
+            https://github.com/VladKiller32/device_xiaomi_gemstones-kernel ${{ env.kernelName }} --depth=1
+
+      - name: "📥 Setup AOSP build environment & Clang r614150"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android13-5.15-lts --depth=1
+          repo sync --optimized-fetch --prune --no-clone-bundle --no-tags -j$(nproc --all)
+          rm -rf .repo common
+
+          aria2c -x 16 -s 16 -o prebuilts/clang/host/linux-x86/clang-r614150.tar.gz "https://github.com/yougotme101/clang/releases/download/v1.0.2/clang-r614150.tar.gz"
+          mkdir -p prebuilts/clang/host/linux-x86/clang-r614150
+          tar -xzf prebuilts/clang/host/linux-x86/clang-r614150.tar.gz -C prebuilts/clang/host/linux-x86/clang-r614150
+          rm -f prebuilts/clang/host/linux-x86/clang-r614150.tar.gz
+
+          sed -i \
+            -e 's/^BRANCH=.*/BRANCH=android13-5.15/' \
+            -e 's/^CLANG_VERSION=.*/CLANG_VERSION=r614150/' \
+            ${{ env.kernelDir }}/${{ env.kernelName }}/build.config.constants
+
+          sed -i '/^DEFCONFIG=gki_defconfig/d' ${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki
+          sed -i '$a\DEFCONFIG=${{ env.DEFCONFIG_NAME }}' ${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki
+          sed -i '/^POST_DEFCONFIG_CMDS="check_defconfig"/d' ${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki
+
+          sed -i \
+            -e '/^KMI_SYMBOL_LIST_STRICT_MODE=/d' \
+            -e '/^TRIM_NONLISTED_KMI=/d' \
+            -e '/^KMI_ENFORCED=/d' \
+            -e '$a\KMI_SYMBOL_LIST_STRICT_MODE=0' \
+            -e '$a\TRIM_NONLISTED_KMI=0' \
+            -e '$a\KMI_ENFORCED=0' \
+            -e '/^MODULES_ORDER=/d' \
+            -e '/^MODULES_LIST=/d' \
+            ${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki.aarch64
+
+      - name: "📐 Setup SWAP 24GB"
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 24
+
+      - name: "🧹 Replace old KSU-Next with latest & tune config"
+        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
+        run: |
+          echo 'KBUILD_CFLAGS += -Wno-default-const-init-unsafe -Wno-uninitialized-const-pointer -Wno-implicit-function-declaration -Wno-sometimes-uninitialized' >> Makefile
+
+          # Удаляем старый KernelSU-Next
+          rm -rf ./KernelSU ./KernelSU-Next ./drivers/kernelsu
+
+          # Ставим свежий KernelSU-Next
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev/kernel/setup.sh" | bash -s ${{ github.event.inputs.ksuBranch }}
+          if [ ! -L "drivers/kernelsu" ]; then
+            ln -sf ../KernelSU-Next drivers/kernelsu
+          fi
+
+          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+
+          # Отключаем старый SUSFS 1.5.12, чтобы не конфликтовал со свежим KSU-Next
+          sed -i '/CONFIG_KSU_SUSFS/d' "$CONFIG_FILE"
+          echo "# CONFIG_KSU_SUSFS is not set" >> "$CONFIG_FILE"
+
+          # Убеждаемся, что KSU и поддержка метамодулей включены
+          sed -i '/^CONFIG_KSU=/d' "$CONFIG_FILE"
+          echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
+          echo "CONFIG_KALLSYMS=y" >> "$CONFIG_FILE"
+          echo "CONFIG_TMPFS_XATTR=y" >> "$CONFIG_FILE"
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$CONFIG_FILE"
+          echo "CONFIG_OVERLAY_FS=y" >> "$CONFIG_FILE"
+
+          # Прописываем твоё имя ядра
+          if [ -n "${{ github.event.inputs.localVersion }}" ]; then
+            sed -i '/^CONFIG_LOCALVERSION=/d' "$CONFIG_FILE"
+            echo 'CONFIG_LOCALVERSION="${{ github.event.inputs.localVersion }}"' >> "$CONFIG_FILE"
+          fi
+
+      - name: "🔨 Build Kernel"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          LTO=full BUILD_CONFIG=${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki.aarch64 build/build.sh -j$(nproc --all)
+
+      - name: "📦 Package AnyKernel3 ZIP"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          git clone --depth=1 https://github.com/yougotme101/AnyKernel3 -b master AnyKernel3
+          cp out/dist/Image AnyKernel3/Image.ksu
+          ZIP_NAME="ChicKernel_KSUNext${{ github.event.inputs.localVersion }}_$(date +'%Y-%m-%d').zip"
+          cd AnyKernel3
+          zip -r9 "../$ZIP_NAME" * -x .git/*
+          cd ..
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: "📤 Upload Flashable ZIP"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.WORK_DIR }}/${{ env.ZIP_NAME }}
+          retention-days: 5
