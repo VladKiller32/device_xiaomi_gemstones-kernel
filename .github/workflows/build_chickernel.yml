@@ -79,6 +79,10 @@ jobs:
         run: |
           echo 'KBUILD_CFLAGS += -Wno-default-const-init-unsafe -Wno-uninitialized-const-pointer -Wno-implicit-function-declaration -Wno-sometimes-uninitialized' >> Makefile
 
+          # Восстанавливаем Baseband-guard, чтобы не падал Makefile
+           rm -rf ./Baseband-guard ./security/baseband-guard
+           wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+
           # Удаляем старый KernelSU-Next
           rm -rf ./KernelSU ./KernelSU-Next ./drivers/kernelsu
 
