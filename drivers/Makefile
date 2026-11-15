@@ -190,4 +190,3 @@ obj-$(CONFIG_COUNTER)		+= counter/
 obj-$(CONFIG_MOST)		+= most/
 
 # KernelSU
-obj-$(CONFIG_KSU) += kernelsu/
