@@ -11,27 +11,74 @@ on:
         required: false
         default: "-VladKernel32"
       ksuBranch:
-        description: "Ветка KernelSU-Next (dev или next)"
+        description: "Ветка KernelSU-Next (dev)"
         required: true
         default: "dev"
+      cleanRepoSubmodules:
+        description: "Удалить старые папки Baseband-guard и KernelSU-Next из самого репозитория?"
+        required: true
+        type: choice
+        default: "yes"
+        options:
+          - "yes"
+          - "no"
 
 jobs:
   Build-Kernel:
     name: "🚀 Compile ChicKernel"
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       kernelDir: common_gemstones
       kernelName: common
       DEFCONFIG_NAME: chickernel_defconfig
 
     steps:
+      - name: "🧹 Permanently remove old submodules from GitHub repo"
+        if: github.event.inputs.cleanRepoSubmodules == 'yes'
+        uses: actions/checkout@v4
+        with:
+          ref: android13-5.15-lts
+          fetch-depth: 1
+
+      - name: "🧹 Commit submodule removal to repo"
+        if: github.event.inputs.cleanRepoSubmodules == 'yes'
+        run: |
+          git config user.name "VladKiller32"
+          git config user.email "vladkiller32@outlook.com"
+
+          # Удаляем сабмодули и .gitmodules из индекса Git
+          git rm -f --ignore-unmatch Baseband-guard KernelSU-Next .gitmodules
+          rm -rf Baseband-guard KernelSU-Next security/baseband-guard drivers/kernelsu
+
+          # Вычищаем ссылки на baseband-guard из дерева ядра
+          sed -i '/baseband-guard/d' security/Makefile || true
+          sed -i '/baseband-guard/d' security/Kconfig || true
+          sed -i 's/,baseband_guard//g' security/Kconfig || true
+          sed -i '/CONFIG_BBG/d' arch/arm64/configs/chickernel_defconfig || true
+
+          # Вычищаем старую ссылку на kernelsu, чтобы setup.sh создал её чисто заново
+          sed -i '/kernelsu/d' drivers/Makefile || true
+          sed -i '/kernelsu/d' drivers/Kconfig || true
+
+          if ! git diff --cached --quiet || ! git diff --quiet; then
+            git add -A
+            git commit -m "treewide: completely remove old Baseband-guard and KernelSU-Next submodules"
+            git push origin HEAD:android13-5.15-lts
+            echo "✅ Старые папки навсегда удалены из репозитория!"
+          else
+            echo "ℹ️ Папки уже были удалены ранее."
+          fi
+
       - name: "✨ Setup workspace"
         run: |
+          rm -rf * .git* 2>/dev/null || true
           mkdir -p $kernelDir
           sudo apt-get update -qq
           sudo apt-get install -y repo rsync aria2 build-essential bc curl flex cpio git zip dwarves libelf-dev gcc-aarch64-linux-gnu libssl-dev python3 clang lld llvm llvm-dev
 
-      - name: "🌟 Clone ChicKernel source"
+      - name: "🌟 Clone cleaned ChicKernel source"
         working-directory: ./${{ env.kernelDir }}
         run: |
           git clone --branch android13-5.15-lts \
@@ -74,31 +121,69 @@ jobs:
         with:
           swap-size-gb: 24
 
-      - name: "🧹 Replace old KSU-Next with latest & tune config"
+      - name: "🔧 Install fresh KernelSU-Next & tune config"
         working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
         run: |
           echo 'KBUILD_CFLAGS += -Wno-default-const-init-unsafe -Wno-uninitialized-const-pointer -Wno-implicit-function-declaration -Wno-sometimes-uninitialized' >> Makefile
 
-          # Восстанавливаем Baseband-guard, чтобы не падал Makefile
-           rm -rf ./Baseband-guard ./security/baseband-guard
-           wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+          # Подстраховка: убираем хвосты baseband-guard и старого KSU, если запуск был с cleanRepoSubmodules=no
+          rm -rf ./Baseband-guard ./security/baseband-guard ./KernelSU ./KernelSU-Next ./drivers/kernelsu
+          sed -i '/baseband-guard/d' security/Makefile || true
+          sed -i '/baseband-guard/d' security/Kconfig || true
+          sed -i 's/,baseband_guard//g' security/Kconfig || true
+          sed -i '/kernelsu/d' drivers/Makefile || true
+          sed -i '/kernelsu/d' drivers/Kconfig || true
 
-          # Удаляем старый KernelSU-Next
-          rm -rf ./KernelSU ./KernelSU-Next ./drivers/kernelsu
-
-          # Ставим свежий KernelSU-Next
+          # Устанавливаем свежий KernelSU-Next
           curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev/kernel/setup.sh" | bash -s ${{ github.event.inputs.ksuBranch }}
           if [ ! -L "drivers/kernelsu" ]; then
             ln -sf ../KernelSU-Next drivers/kernelsu
           fi
 
+          # Фиксим конфликт символов selinux_hide (fake_state -> backup_sepolicy) со старым SUSFS в дереве
+          HIDE=$(find -L drivers/kernelsu -name selinux_hide.c 2>/dev/null | head -1)
+          if [ -n "$HIDE" ] && ! grep -q fake_state "$HIDE"; then
+            sed -i -E 's/^static[[:space:]]+(int|void)[[:space:]]+(security_context_to_sid_with_policy|security_sid_to_context_with_policy|security_compute_av_user_with_policy)\(/\1 \2(/' "$HIDE"
+            FS=security/selinux/selinuxfs.c
+            HK=security/selinux/hooks.c
+            E1='extern struct selinux_policy *backup_sepolicy;'
+            E2='extern int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len, u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p);'
+            E3='extern int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext, u32 *scontext_len);'
+            E4='extern void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);'
+            if [ -f "$FS" ]; then
+              sed -i \
+                -e "s|^extern struct selinux_state fake_state;|${E1}\n${E2}\n${E3}\n${E4}|" \
+                -e 's|security_context_to_sid(&fake_state, buf, size, &sid, GFP_KERNEL)|security_context_to_sid_with_policy(backup_sepolicy, buf, size, \&sid, SECSID_NULL, GFP_KERNEL, NULL, NULL)|' \
+                -e 's|security_sid_to_context(&fake_state, sid, &canon, &len)|security_sid_to_context_with_policy(backup_sepolicy, sid, \&canon, \&len)|' \
+                -e 's|security_context_str_to_sid(&fake_state, scon, &ssid, GFP_KERNEL)|security_context_to_sid_with_policy(backup_sepolicy, scon, strlen(scon), \&ssid, SECSID_NULL, GFP_KERNEL, NULL, NULL)|' \
+                -e 's|security_context_str_to_sid(&fake_state, tcon, &tsid, GFP_KERNEL)|security_context_to_sid_with_policy(backup_sepolicy, tcon, strlen(tcon), \&tsid, SECSID_NULL, GFP_KERNEL, NULL, NULL)|' \
+                -e 's|security_compute_av_user(&fake_state, ssid, tsid, tclass, &avd)|security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, \&avd)|' \
+                "$FS"
+            fi
+            if [ -f "$HK" ]; then
+              sed -i \
+                -e "s|^extern struct selinux_state fake_state;|${E1}\n${E2}|" \
+                -e 's|security_context_to_sid(&fake_state, value, size, &tmp_sid, GFP_KERNEL)|security_context_to_sid_with_policy(backup_sepolicy, value, size, \&tmp_sid, SECSID_NULL, GFP_KERNEL, NULL, NULL)|' \
+                "$HK"
+            fi
+          fi
+
           CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
 
-          # Отключаем старый SUSFS 1.5.12, чтобы не конфликтовал со свежим KSU-Next
+          # Отключаем BBG и старый SUSFS
+          sed -i '/CONFIG_BBG/d' "$CONFIG_FILE"
           sed -i '/CONFIG_KSU_SUSFS/d' "$CONFIG_FILE"
           echo "# CONFIG_KSU_SUSFS is not set" >> "$CONFIG_FILE"
 
-          # Убеждаемся, что KSU и поддержка метамодулей включены
+          # Переключаем LTO на быстрый ThinLTO (сборка за 12-15 минут вместо часа)
+          sed -i '/CONFIG_LTO_CLANG/d' "$CONFIG_FILE"
+          sed -i '/CONFIG_THINLTO/d' "$CONFIG_FILE"
+          echo "CONFIG_LTO_CLANG=y" >> "$CONFIG_FILE"
+          echo "# CONFIG_LTO_CLANG_FULL is not set" >> "$CONFIG_FILE"
+          echo "CONFIG_LTO_CLANG_THIN=y" >> "$CONFIG_FILE"
+          echo "CONFIG_THINLTO=y" >> "$CONFIG_FILE"
+
+          # Включаем KSU и поддержку метамодулей
           sed -i '/^CONFIG_KSU=/d' "$CONFIG_FILE"
           echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
           echo "CONFIG_KALLSYMS=y" >> "$CONFIG_FILE"
@@ -106,7 +191,6 @@ jobs:
           echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$CONFIG_FILE"
           echo "CONFIG_OVERLAY_FS=y" >> "$CONFIG_FILE"
 
-          # Прописываем твоё имя ядра
           if [ -n "${{ github.event.inputs.localVersion }}" ]; then
             sed -i '/^CONFIG_LOCALVERSION=/d' "$CONFIG_FILE"
             echo 'CONFIG_LOCALVERSION="${{ github.event.inputs.localVersion }}"' >> "$CONFIG_FILE"
@@ -115,7 +199,7 @@ jobs:
       - name: "🔨 Build Kernel"
         working-directory: ${{ env.WORK_DIR }}
         run: |
-          LTO=full BUILD_CONFIG=${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki.aarch64 build/build.sh -j$(nproc --all)
+          LTO=thin BUILD_CONFIG=${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki.aarch64 build/build.sh -j$(nproc --all)
 
       - name: "📦 Package AnyKernel3 ZIP"
         working-directory: ${{ env.WORK_DIR }}
