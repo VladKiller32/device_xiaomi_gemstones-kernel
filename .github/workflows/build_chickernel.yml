@@ -14,68 +14,24 @@ on:
         description: "Ветка KernelSU-Next (dev)"
         required: true
         default: "dev"
-      cleanRepoSubmodules:
-        description: "Удалить старые папки Baseband-guard и KernelSU-Next из самого репозитория?"
-        required: true
-        type: choice
-        default: "no"
-        options:
-          - "no"
-          - "yes"
 
 jobs:
   Build-Kernel:
     name: "🚀 Compile ChicKernel"
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     env:
       kernelDir: common_gemstones
       kernelName: common
       DEFCONFIG_NAME: chickernel_defconfig
 
     steps:
-      - name: "🧹 Permanently remove old submodules from GitHub repo"
-        if: github.event.inputs.cleanRepoSubmodules == 'yes'
-        uses: actions/checkout@v4
-        with:
-          ref: android13-5.15-lts
-          fetch-depth: 1
-
-      - name: "🧹 Commit submodule removal to repo"
-        if: github.event.inputs.cleanRepoSubmodules == 'yes'
-        run: |
-          git config user.name "VladKiller32"
-          git config user.email "vladkiller32@outlook.com"
-
-          git rm -f --ignore-unmatch Baseband-guard KernelSU-Next .gitmodules
-          rm -rf Baseband-guard KernelSU-Next security/baseband-guard drivers/kernelsu
-
-          sed -i '/baseband-guard/d' security/Makefile || true
-          sed -i '/baseband-guard/d' security/Kconfig || true
-          sed -i 's/,baseband_guard//g' security/Kconfig || true
-          sed -i '/CONFIG_BBG/d' arch/arm64/configs/chickernel_defconfig || true
-
-          sed -i '/kernelsu/d' drivers/Makefile || true
-          sed -i '/kernelsu/d' drivers/Kconfig || true
-
-          if ! git diff --cached --quiet || ! git diff --quiet; then
-            git add -A
-            git commit -m "treewide: completely remove old Baseband-guard and KernelSU-Next submodules"
-            git push origin HEAD:android13-5.15-lts
-            echo "✅ Старые папки навсегда удалены из репозитория!"
-          else
-            echo "ℹ️ Папки уже были удалены ранее."
-          fi
-
       - name: "✨ Setup workspace"
         run: |
-          rm -rf * .git* 2>/dev/null || true
           mkdir -p $kernelDir
           sudo apt-get update -qq
           sudo apt-get install -y repo rsync aria2 build-essential bc curl flex cpio git zip dwarves libelf-dev gcc-aarch64-linux-gnu libssl-dev python3 clang lld llvm llvm-dev
 
-      - name: "🌟 Clone cleaned ChicKernel source"
+      - name: "🌟 Clone ChicKernel source"
         working-directory: ./${{ env.kernelDir }}
         run: |
           git clone --branch android13-5.15-lts \
@@ -118,12 +74,12 @@ jobs:
         with:
           swap-size-gb: 24
 
-      - name: "🔧 Install fresh KernelSU-Next & tune config"
+      - name: "🔧 Install fresh KernelSU-Next & Legacy Hooks Bridge"
         working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
         run: |
           echo 'KBUILD_CFLAGS += -Wno-default-const-init-unsafe -Wno-uninitialized-const-pointer -Wno-implicit-function-declaration -Wno-sometimes-uninitialized' >> Makefile
 
-          # Подстраховка: убираем хвосты baseband-guard и старого KSU
+          # Вычищаем хвосты baseband-guard и старого KSU
           rm -rf ./Baseband-guard ./security/baseband-guard ./KernelSU ./KernelSU-Next ./drivers/kernelsu
           sed -i '/baseband-guard/d' security/Makefile || true
           sed -i '/baseband-guard/d' security/Kconfig || true
@@ -131,32 +87,33 @@ jobs:
           sed -i '/kernelsu/d' drivers/Makefile || true
           sed -i '/kernelsu/d' drivers/Kconfig || true
 
-          # Отключаем старые ручные хуки KSU в файлах ядра (так как новый KSU-Next v3.4.2 использует Kprobes/Tracepoints)
-          for f in fs/open.c fs/read_write.c fs/stat.c fs/exec.c drivers/tty/pty.c drivers/input/input.c fs/namespace.c; do
-            if [ -f "$f" ]; then
-              sed -i 's/#ifdef CONFIG_KSU$/#ifdef CONFIG_KSU_LEGACY_MANUAL_HOOKS_DISABLED/g' "$f"
-              sed -i 's/#if defined(CONFIG_KSU)$/#if defined(CONFIG_KSU_LEGACY_MANUAL_HOOKS_DISABLED)/g' "$f"
-              sed -i 's/ksu_handle_stat([^;]*;/0;/g' "$f"
-              sed -i 's/ksu_handle_sys_read([^;]*;/0;/g' "$f"
-              sed -i 's/ksu_handle_vfs_read([^;]*;/0;/g' "$f"
-              sed -i 's/ksu_handle_faccessat([^;]*;/0;/g' "$f"
-              sed -i 's/ksu_handle_execveat([^;]*;/0;/g' "$f"
-              sed -i 's/ksu_handle_execveat_sucompat([^;]*;/0;/g' "$f"
-              sed -i 's/ksu_handle_devpts([^;]*;/0;/g' "$f"
-              sed -i 's/ksu_handle_input_handle_event([^;]*;/0;/g' "$f"
-              sed -i 's/unlikely(ksu_execveat_hook)/0/g' "$f"
-              sed -i 's/unlikely(ksu_vfs_read_hook)/0/g' "$f"
-              sed -i 's/unlikely(ksu_input_hook)/0/g' "$f"
-            fi
-          done
-
-          # Устанавливаем свежий KernelSU-Next
+          # Ставим свежий KernelSU-Next
           curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev/kernel/setup.sh" | bash -s ${{ github.event.inputs.ksuBranch }}
           if [ ! -L "drivers/kernelsu" ]; then
             ln -sf ../KernelSU-Next drivers/kernelsu
           fi
 
-          # Фиксим конфликт символов selinux_hide (с учётом макроса __nocfi на строке 1517)
+          # Создаём C-адаптер для старых символов ручных хуков ChicKernel (чтобы не ломать файлы ядра через sed и не было undefined symbol на vmlinux.o)
+          cat << 'EOF' > kernel/ksu_legacy_bridge.c
+          #include <linux/types.h>
+          #include <linux/export.h>
+
+          bool ksu_execveat_hook __read_mostly = false;
+          bool ksu_vfs_read_hook __read_mostly = false;
+          bool ksu_input_hook __read_mostly = false;
+
+          int __weak ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags) { return 0; }
+          int __weak ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr) { return 0; }
+          int __weak ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos) { return 0; }
+          int __weak ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags) { return 0; }
+          int __weak ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags) { return 0; }
+          int __weak ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags) { return 0; }
+          int __weak ksu_handle_devpts(struct inode *inode) { return 0; }
+          int __weak ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value) { return 0; }
+          EOF
+          echo "obj-y += ksu_legacy_bridge.o" >> kernel/Makefile
+
+          # Фиксим конфликт символов selinux_hide (с учётом макроса __nocfi)
           HIDE=$(find -L drivers/kernelsu -name selinux_hide.c 2>/dev/null | head -1)
           if [ -n "$HIDE" ] && ! grep -q fake_state "$HIDE"; then
             sed -i -E 's/^static[[:space:]]+(int|void)([[:space:]]+__nocfi)?[[:space:]]+(security_context_to_sid_with_policy|security_sid_to_context_with_policy|security_compute_av_user_with_policy)\(/\1\2 \3(/' "$HIDE"
@@ -186,12 +143,10 @@ jobs:
 
           CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
 
-          # Отключаем BBG и старый SUSFS
           sed -i '/CONFIG_BBG/d' "$CONFIG_FILE"
           sed -i '/CONFIG_KSU_SUSFS/d' "$CONFIG_FILE"
           echo "# CONFIG_KSU_SUSFS is not set" >> "$CONFIG_FILE"
 
-          # Переключаем LTO на быстрый ThinLTO
           sed -i '/CONFIG_LTO_CLANG/d' "$CONFIG_FILE"
           sed -i '/CONFIG_THINLTO/d' "$CONFIG_FILE"
           echo "CONFIG_LTO_CLANG=y" >> "$CONFIG_FILE"
@@ -199,7 +154,6 @@ jobs:
           echo "CONFIG_LTO_CLANG_THIN=y" >> "$CONFIG_FILE"
           echo "CONFIG_THINLTO=y" >> "$CONFIG_FILE"
 
-          # Включаем KSU, KPROBES и поддержку метамодулей
           sed -i '/^CONFIG_KSU=/d' "$CONFIG_FILE"
           sed -i '/CONFIG_KPROBES/d' "$CONFIG_FILE"
           echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
@@ -216,10 +170,17 @@ jobs:
             echo 'CONFIG_LOCALVERSION="${{ github.event.inputs.localVersion }}"' >> "$CONFIG_FILE"
           fi
 
-      - name: "🔨 Build Kernel"
+      - name: "🔨 Build Kernel (with automatic error extractor)"
         working-directory: ${{ env.WORK_DIR }}
         run: |
-          LTO=thin BUILD_CONFIG=${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki.aarch64 build/build.sh -j$(nproc --all)
+          set -o pipefail
+          if ! LTO=thin BUILD_CONFIG=${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki.aarch64 build/build.sh -j$(nproc --all) 2>&1 | tee build_full.log; then
+            echo "===================================================="
+            echo "❌ СВОДКА ВСЕХ ОШИБОК КОМПИЛЯЦИИ (НАЙДЕНО АВТОМАТИЧЕСКИ):"
+            grep -E "error:|undefined symbol:|FAILED:" build_full.log | tail -n 40
+            echo "===================================================="
+            exit 1
+          fi
 
       - name: "📦 Package AnyKernel3 ZIP"
         working-directory: ${{ env.WORK_DIR }}
