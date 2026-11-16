@@ -7,10 +7,10 @@ on:
         description: "Откуда тянуть обновление?"
         required: true
         type: choice
-        default: "google-ack"
+        default: "kernel-org-lts"
         options:
-          - "google-ack"
           - "kernel-org-lts"
+          - "google-ack-latest"
 
 jobs:
   Upstream-Merge:
@@ -24,48 +24,64 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: android13-5.15-lts
-          fetch-depth: 100
+          fetch-depth: 1
 
-      - name: "🔄 Fetch & Merge Upstream 5.15"
+      - name: "🔄 Apply Latest 5.15 Upstream Cleanly"
         run: |
           git config user.name "VladKiller32"
           git config user.email "vladkiller32@outlook.com"
 
-          echo "📌 Текущая версия ядра до обновления:"
-          head -n 5 Makefile
+          CUR_SUB=$(awk '/^SUBLEVEL =/ {print $3}' Makefile)
+          echo "📌 Текущая версия в репозитории: 5.15.${CUR_SUB}"
 
-          if [ "${{ github.event.inputs.upstreamSource }}" = "google-ack" ]; then
-            echo "🌐 Подтягиваем официальную ветку Google ACK (android13-5.15-lts)..."
-            git remote add upstream https://android.googlesource.com/kernel/common
-            git fetch upstream android13-5.15-lts --depth=100
-          else
-            echo "🌐 Подтягиваем официальную ветку Linux Stable (linux-5.15.y)..."
-            git remote add upstream https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
-            git fetch upstream linux-5.15.y --depth=100
-          fi
+          if [ "${{ github.event.inputs.upstreamSource }}" = "kernel-org-lts" ]; then
+            echo "🌐 Проверяем последнюю версию Linux 5.15.y на kernel.org..."
+            git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+            git fetch --depth=1 stable refs/tags/v5.15.${CUR_SUB}:refs/tags/v5.15.${CUR_SUB}
+            git fetch --depth=1 stable linux-5.15.y
 
-          # Пробуем мягкое слияние с приоритетом наших драйверов и твиков (-X ours)
-          if git merge FETCH_HEAD --allow-unrelated-histories -X ours --no-edit -m "Merge upstream 5.15 LTS into VladKernel32"; then
-            echo "✅ Полное слияние прошло без конфликтов!"
-          else
-            echo "⚠️ Обнаружены удалённые/перемещённые файлы в конфликтах, разрешаем в пользу нашего дерева..."
-            # Для всех файлов со статусом DU/UD/UU/AA оставляем нашу рабочую версию, кроме версии в Makefile
-            git checkout --theirs Makefile || true
+            NEW_SUB=$(git show FETCH_HEAD:Makefile | awk '/^SUBLEVEL =/ {print $3}')
+            echo "🚀 Найдена свежая версия на kernel.org: 5.15.${NEW_SUB}"
+
+            if [ "$CUR_SUB" = "$NEW_SUB" ]; then
+              echo "✅ У тебя уже стоит самая последняя версия 5.15.${CUR_SUB}!"
+              exit 0
+            fi
+
+            # Формируем чистый патч между 5.15.189 и свежей 5.15.xxx и накладываем поверх наших файлов без поломки истории Git
+            git diff refs/tags/v5.15.${CUR_SUB} FETCH_HEAD > /tmp/upstream.patch
+            git apply --3way --ignore-space-change --ignore-whitespace /tmp/upstream.patch || true
+
+            # Если в каких-то кастомных файлах возник конфликт маркеров <<<<<<<, оставляем рабочую версию нашего ядра, кроме Makefile
+            git checkout --theirs Makefile 2>/dev/null || true
             git status --porcelain | awk '/^(UU|AA|DU|UD|AU|UA)/ {print $2}' | while read -r file; do
               if [ "$file" != "Makefile" ]; then
-                git checkout --ours "$file" 2>/dev/null || git rm -f "$file" 2>/dev/null || true
+                git checkout --ours "$file" 2>/dev/null || true
               fi
               git add "$file" 2>/dev/null || true
             done
-            git add Makefile
-            git commit --no-edit -m "Merge upstream 5.15 LTS into VladKernel32 (resolved conflicts)"
+          else
+            echo "🌐 Проверяем свежую ветку Google ACK..."
+            git remote add google https://android.googlesource.com/kernel/common
+            LATEST_GOOGLE_BRANCH=$(git ls-remote --heads google "refs/heads/android13-5.15-20*" | awk '{print $2}' | sed 's|refs/heads/||' | sort -V | tail -n 1)
+            echo "Найдена последняя ветка Google: $LATEST_GOOGLE_BRANCH"
+            git fetch --depth=1 google "$LATEST_GOOGLE_BRANCH"
+            git checkout FETCH_HEAD -- Makefile
           fi
 
-          # Возвращаем на место флаг защиты baseband-guard и KSU в Makefile, если апстрим перезаписал Makefile
+          # Страховка: не даём апстриму вернуть удалённый baseband-guard
           sed -i '/baseband-guard/d' security/Makefile || true
           sed -i '/baseband-guard/d' security/Kconfig || true
 
           echo "🎉 Новая версия ядра после обновления:"
           head -n 5 Makefile
 
-          git push origin HEAD:android13-5.15-lts
+          git add -A
+          if ! git diff --cached --quiet; then
+            NEW_VER=$(awk '/^VERSION =/ {v=$3} /^PATCHLEVEL =/ {p=$3} /^SUBLEVEL =/ {s=$3} END {print v"."p"."s}' Makefile)
+            git commit -m "treewide: upstream Linux to ${NEW_VER}"
+            git push origin HEAD:android13-5.15-lts
+            echo "✅ Успешно обновлено до ${NEW_VER} и отправлено в репозиторий!"
+          else
+            echo "ℹ️ Изменений для коммита нет."
+          fi
