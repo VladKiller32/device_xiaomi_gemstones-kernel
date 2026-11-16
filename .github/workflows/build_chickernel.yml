@@ -191,7 +191,10 @@ jobs:
         working-directory: ${{ env.WORK_DIR }}
         run: |
           git clone --depth=1 https://github.com/yougotme101/AnyKernel3 -b master AnyKernel3
-          cp out/dist/Image AnyKernel3/Image.ksu
+          IMAGE_PATH=$(find out -path "*/dist/Image" | head -n 1)
+          echo "✅ Найден готовый образ ядра: $IMAGE_PATH"
+          cp "$IMAGE_PATH" AnyKernel3/Image
+          cp "$IMAGE_PATH" AnyKernel3/Image.ksu
           ZIP_NAME="ChicKernel_KSUNext${{ github.event.inputs.localVersion }}_$(date +'%Y-%m-%d').zip"
           cd AnyKernel3
           zip -r9 "../$ZIP_NAME" * -x .git/*
