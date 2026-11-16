@@ -93,14 +93,19 @@ jobs:
             ln -sf ../KernelSU-Next drivers/kernelsu
           fi
 
-          # Создаём C-адаптер для старых символов ручных хуков ChicKernel (чтобы не ломать файлы ядра через sed и не было undefined symbol на vmlinux.o)
+          # Создаём чистый C-адаптер со всеми заголовками для старых символов ручных хуков ChicKernel
           cat << 'EOF' > kernel/ksu_legacy_bridge.c
           #include <linux/types.h>
           #include <linux/export.h>
+          #include <linux/fs.h>
 
-          bool ksu_execveat_hook __read_mostly = false;
-          bool ksu_vfs_read_hook __read_mostly = false;
-          bool ksu_input_hook __read_mostly = false;
+          struct filename;
+          struct inode;
+          struct file;
+
+          bool ksu_execveat_hook = false;
+          bool ksu_vfs_read_hook = false;
+          bool ksu_input_hook = false;
 
           int __weak ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags) { return 0; }
           int __weak ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr) { return 0; }
