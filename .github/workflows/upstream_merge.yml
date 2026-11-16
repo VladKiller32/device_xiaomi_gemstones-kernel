@@ -10,7 +10,6 @@ on:
         default: "kernel-org-lts"
         options:
           - "kernel-org-lts"
-          - "google-ack-latest"
 
 jobs:
   Upstream-Merge:
@@ -34,40 +33,28 @@ jobs:
           CUR_SUB=$(awk '/^SUBLEVEL =/ {print $3}' Makefile)
           echo "📌 Текущая версия в репозитории: 5.15.${CUR_SUB}"
 
-          if [ "${{ github.event.inputs.upstreamSource }}" = "kernel-org-lts" ]; then
-            echo "🌐 Проверяем последнюю версию Linux 5.15.y на kernel.org..."
-            git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
-            git fetch --depth=1 stable refs/tags/v5.15.${CUR_SUB}:refs/tags/v5.15.${CUR_SUB}
-            git fetch --depth=1 stable linux-5.15.y
+          echo "🌐 Проверяем последнюю версию Linux 5.15.y на kernel.org..."
+          git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+          git fetch --depth=1 stable refs/tags/v5.15.${CUR_SUB}:refs/tags/v5.15.${CUR_SUB}
+          git fetch --depth=1 stable linux-5.15.y
 
-            NEW_SUB=$(git show FETCH_HEAD:Makefile | awk '/^SUBLEVEL =/ {print $3}')
-            echo "🚀 Найдена свежая версия на kernel.org: 5.15.${NEW_SUB}"
+          NEW_SUB=$(git show FETCH_HEAD:Makefile | awk '/^SUBLEVEL =/ {print $3}')
+          echo "🚀 Найдена свежая версия на kernel.org: 5.15.${NEW_SUB}"
 
-            if [ "$CUR_SUB" = "$NEW_SUB" ]; then
-              echo "✅ У тебя уже стоит самая последняя версия 5.15.${CUR_SUB}!"
-              exit 0
-            fi
-
-            # Формируем чистый патч между 5.15.189 и свежей 5.15.xxx и накладываем поверх наших файлов без поломки истории Git
-            git diff refs/tags/v5.15.${CUR_SUB} FETCH_HEAD > /tmp/upstream.patch
-            git apply --3way --ignore-space-change --ignore-whitespace /tmp/upstream.patch || true
-
-            # Если в каких-то кастомных файлах возник конфликт маркеров <<<<<<<, оставляем рабочую версию нашего ядра, кроме Makefile
-            git checkout --theirs Makefile 2>/dev/null || true
-            git status --porcelain | awk '/^(UU|AA|DU|UD|AU|UA)/ {print $2}' | while read -r file; do
-              if [ "$file" != "Makefile" ]; then
-                git checkout --ours "$file" 2>/dev/null || true
-              fi
-              git add "$file" 2>/dev/null || true
-            done
-          else
-            echo "🌐 Проверяем свежую ветку Google ACK..."
-            git remote add google https://android.googlesource.com/kernel/common
-            LATEST_GOOGLE_BRANCH=$(git ls-remote --heads google "refs/heads/android13-5.15-20*" | awk '{print $2}' | sed 's|refs/heads/||' | sort -V | tail -n 1)
-            echo "Найдена последняя ветка Google: $LATEST_GOOGLE_BRANCH"
-            git fetch --depth=1 google "$LATEST_GOOGLE_BRANCH"
-            git checkout FETCH_HEAD -- Makefile
+          if [ "$CUR_SUB" = "$NEW_SUB" ]; then
+            echo "✅ У тебя уже стоит самая последняя версия 5.15.${CUR_SUB}!"
+            exit 0
           fi
+
+          # Формируем патч и применяем все подходящие файлы с флагом --reject (чтобы не откатывало весь патч из-за кастомных файлов)
+          git diff refs/tags/v5.15.${CUR_SUB} FETCH_HEAD > /tmp/upstream.patch
+          git apply --reject --ignore-space-change --ignore-whitespace /tmp/upstream.patch || true
+
+          # Удаляем временные .rej файлы от кастомных драйверов, где осталась наша версия
+          find . -name "*.rej" -delete
+
+          # Принудительно обновляем цифру SUBLEVEL в нашем Makefile, не ломая кастомные флаги ChicKernel
+          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${NEW_SUB}/" Makefile
 
           # Страховка: не даём апстриму вернуть удалённый baseband-guard
           sed -i '/baseband-guard/d' security/Makefile || true
@@ -78,10 +65,9 @@ jobs:
 
           git add -A
           if ! git diff --cached --quiet; then
-            NEW_VER=$(awk '/^VERSION =/ {v=$3} /^PATCHLEVEL =/ {p=$3} /^SUBLEVEL =/ {s=$3} END {print v"."p"."s}' Makefile)
-            git commit -m "treewide: upstream Linux to ${NEW_VER}"
+            git commit -m "treewide: upstream Linux from 5.15.${CUR_SUB} to 5.15.${NEW_SUB}"
             git push origin HEAD:android13-5.15-lts
-            echo "✅ Успешно обновлено до ${NEW_VER} и отправлено в репозиторий!"
+            echo "✅ Успешно обновлено до 5.15.${NEW_SUB} и отправлено в репозиторий!"
           else
             echo "ℹ️ Изменений для коммита нет."
           fi
