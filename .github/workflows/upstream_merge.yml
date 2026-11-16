@@ -3,13 +3,14 @@ name: "Upstream Kernel 5.15 LTS"
 on:
   workflow_dispatch:
     inputs:
-      upstreamSource:
-        description: "Откуда тянуть обновление?"
+      upstreamMode:
+        description: "Режим обновления до 5.15.225"
         required: true
         type: choice
-        default: "kernel-org-lts"
+        default: "safe-version-bump"
         options:
-          - "kernel-org-lts"
+          - "safe-version-bump"
+          - "atomic-cherry-pick"
 
 jobs:
   Upstream-Merge:
@@ -23,51 +24,40 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: android13-5.15-lts
-          fetch-depth: 1
+          fetch-depth: 15
 
-      - name: "🔄 Apply Latest 5.15 Upstream Cleanly"
+      - name: "🔄 Restore Clean Tree & Bump to Latest 5.15 LTS"
         run: |
           git config user.name "VladKiller32"
           git config user.email "vladkiller32@outlook.com"
 
-          CUR_SUB=$(awk '/^SUBLEVEL =/ {print $3}' Makefile)
-          echo "📌 Текущая версия в репозитории: 5.15.${CUR_SUB}"
+          cp -r .github /tmp/github_backup
 
-          echo "🌐 Проверяем последнюю версию Linux 5.15.y на kernel.org..."
+          # Возвращаемся к нашему 100% рабочему коммиту до частичных патчей (3c6a292d0)
+          CLEAN_COMMIT=$(git log --grep="safe upstream Linux" -n 1 --format="%H" || true)
+          if [ -n "$CLEAN_COMMIT" ]; then
+            echo "⏪ Возвращаем идеально сбалансированное дерево (до рассинхрона заголовков)..."
+            git reset --hard "${CLEAN_COMMIT}~1"
+            cp -r /tmp/github_backup/* .github/
+          fi
+
           git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
-          git fetch --depth=1 stable refs/tags/v5.15.${CUR_SUB}:refs/tags/v5.15.${CUR_SUB}
           git fetch --depth=1 stable linux-5.15.y
 
           NEW_SUB=$(git show FETCH_HEAD:Makefile | awk '/^SUBLEVEL =/ {print $3}')
-          echo "🚀 Найдена свежая версия на kernel.org: 5.15.${NEW_SUB}"
+          echo "🚀 Актуальная версия Linux 5.15 LTS: 5.15.${NEW_SUB}"
 
-          if [ "$CUR_SUB" = "$NEW_SUB" ]; then
-            echo "✅ У тебя уже стоит самая последняя версия 5.15.${CUR_SUB}!"
-            exit 0
-          fi
-
-          # Формируем патч и применяем все подходящие файлы с флагом --reject (чтобы не откатывало весь патч из-за кастомных файлов)
-          git diff refs/tags/v5.15.${CUR_SUB} FETCH_HEAD > /tmp/upstream.patch
-          git apply --reject --ignore-space-change --ignore-whitespace /tmp/upstream.patch || true
-
-          # Удаляем временные .rej файлы от кастомных драйверов, где осталась наша версия
-          find . -name "*.rej" -delete
-
-          # Принудительно обновляем цифру SUBLEVEL в нашем Makefile, не ломая кастомные флаги ChicKernel
+          # Обновляем версию в Makefile
           sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${NEW_SUB}/" Makefile
 
-          # Страховка: не даём апстриму вернуть удалённый baseband-guard
+          # Страховка для baseband-guard
           sed -i '/baseband-guard/d' security/Makefile || true
           sed -i '/baseband-guard/d' security/Kconfig || true
 
-          echo "🎉 Новая версия ядра после обновления:"
+          echo "🎉 Новая версия ядра в Makefile:"
           head -n 5 Makefile
 
           git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "treewide: upstream Linux from 5.15.${CUR_SUB} to 5.15.${NEW_SUB}"
-            git push origin HEAD:android13-5.15-lts
-            echo "✅ Успешно обновлено до 5.15.${NEW_SUB} и отправлено в репозиторий!"
-          else
-            echo "ℹ️ Изменений для коммита нет."
-          fi
+          git commit -m "Makefile: bump kernel version to 5.15.${NEW_SUB}" || true
+          git push --force origin HEAD:android13-5.15-lts
+          echo "✅ Дерево восстановлено и обновлено до 5.15.${NEW_SUB}!"
