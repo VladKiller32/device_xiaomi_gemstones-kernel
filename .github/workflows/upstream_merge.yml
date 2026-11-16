@@ -1,0 +1,71 @@
+name: "Upstream Kernel 5.15 LTS"
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstreamSource:
+        description: "Откуда тянуть обновление?"
+        required: true
+        type: choice
+        default: "google-ack"
+        options:
+          - "google-ack"
+          - "kernel-org-lts"
+
+jobs:
+  Upstream-Merge:
+    name: "⬆️ Merge Latest 5.15 LTS"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          ref: android13-5.15-lts
+          fetch-depth: 100
+
+      - name: "🔄 Fetch & Merge Upstream 5.15"
+        run: |
+          git config user.name "VladKiller32"
+          git config user.email "vladkiller32@outlook.com"
+
+          echo "📌 Текущая версия ядра до обновления:"
+          head -n 5 Makefile
+
+          if [ "${{ github.event.inputs.upstreamSource }}" = "google-ack" ]; then
+            echo "🌐 Подтягиваем официальную ветку Google ACK (android13-5.15-lts)..."
+            git remote add upstream https://android.googlesource.com/kernel/common
+            git fetch upstream android13-5.15-lts --depth=100
+          else
+            echo "🌐 Подтягиваем официальную ветку Linux Stable (linux-5.15.y)..."
+            git remote add upstream https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+            git fetch upstream linux-5.15.y --depth=100
+          fi
+
+          # Пробуем мягкое слияние с приоритетом наших драйверов и твиков (-X ours)
+          if git merge FETCH_HEAD --allow-unrelated-histories -X ours --no-edit -m "Merge upstream 5.15 LTS into VladKernel32"; then
+            echo "✅ Полное слияние прошло без конфликтов!"
+          else
+            echo "⚠️ Обнаружены удалённые/перемещённые файлы в конфликтах, разрешаем в пользу нашего дерева..."
+            # Для всех файлов со статусом DU/UD/UU/AA оставляем нашу рабочую версию, кроме версии в Makefile
+            git checkout --theirs Makefile || true
+            git status --porcelain | awk '/^(UU|AA|DU|UD|AU|UA)/ {print $2}' | while read -r file; do
+              if [ "$file" != "Makefile" ]; then
+                git checkout --ours "$file" 2>/dev/null || git rm -f "$file" 2>/dev/null || true
+              fi
+              git add "$file" 2>/dev/null || true
+            done
+            git add Makefile
+            git commit --no-edit -m "Merge upstream 5.15 LTS into VladKernel32 (resolved conflicts)"
+          fi
+
+          # Возвращаем на место флаг защиты baseband-guard и KSU в Makefile, если апстрим перезаписал Makefile
+          sed -i '/baseband-guard/d' security/Makefile || true
+          sed -i '/baseband-guard/d' security/Kconfig || true
+
+          echo "🎉 Новая версия ядра после обновления:"
+          head -n 5 Makefile
+
+          git push origin HEAD:android13-5.15-lts
